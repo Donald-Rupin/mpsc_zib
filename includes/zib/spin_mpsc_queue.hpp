@@ -140,8 +140,7 @@ namespace zib {
                     push(node_buffer* _ptr)
                     {
                         auto write_idx = write_count_.load(std::memory_order_relaxed);
-
-                        if (write_idx + 1 == read_count_.load(std::memory_order_relaxed))
+                        if (write_idx + 1 == read_count_.load(std::memory_order_acquire))
                         {
                             delete _ptr;
                             return;
@@ -259,58 +258,55 @@ namespace zib {
             std::optional<T>
             dequeue() noexcept
             {
+                std::int64_t prev_index = -2;
                 while (true)
                 {
-                    std::int64_t prev_index = -2;
-                    while (true)
+                    auto         min_count = kEmpty;
+                    std::int64_t min_index = -1;
+
+                    for (std::uint64_t i = 0; i < heads_.size(); ++i)
                     {
-                        auto         min_count = kEmpty;
-                        std::int64_t min_index = -1;
+                        assert(heads_[i]->read_head_ < BufferSize);
 
-                        for (std::uint64_t i = 0; i < heads_.size(); ++i)
+                        auto count = heads_[i]->elements_[heads_[i]->read_head_].count_.load(
+                            std::memory_order_acquire);
+
+                        if (count < min_count)
                         {
-                            assert(heads_[i]->read_head_ < BufferSize);
-
-                            auto count = heads_[i]->elements_[heads_[i]->read_head_].count_.load(
-                                std::memory_order_acquire);
-
-                            if (count < min_count)
+                            min_count = count;
+                            min_index = i;
+                            if (min_count == lowest_seen_)
                             {
-                                min_count = count;
-                                min_index = i;
-                                if (min_count == lowest_seen_)
-                                {
-                                    prev_index = i;
-                                    break;
-                                }
+                                prev_index = i;
+                                break;
                             }
                         }
-
-                        if (min_index == -1 && prev_index == min_index) { return std::nullopt; }
-
-                        if (prev_index == min_index)
-                        {
-                            auto data =
-                                heads_[min_index]->elements_[heads_[min_index]->read_head_++].data_;
-
-                            if (heads_[min_index]->read_head_ == BufferSize)
-                            {
-
-                                auto tmp          = heads_[min_index];
-                                heads_[min_index] = tmp->next_;
-
-                                assert(heads_[min_index]);
-
-                                buffers_[min_index].push(tmp);
-                            }
-
-                            if (lowest_seen_ == min_count) { ++lowest_seen_; }
-
-                            return data;
-                        }
-
-                        prev_index = min_index;
                     }
+
+                    if (min_index == -1 && prev_index == min_index) { return std::nullopt; }
+
+                    if (prev_index == min_index)
+                    {
+                        auto data =
+                            heads_[min_index]->elements_[heads_[min_index]->read_head_++].data_;
+
+                        if (heads_[min_index]->read_head_ == BufferSize)
+                        {
+
+                            auto tmp          = heads_[min_index];
+                            heads_[min_index] = tmp->next_;
+
+                            assert(heads_[min_index]);
+
+                            buffers_[min_index].push(tmp);
+                        }
+
+                        if (lowest_seen_ == min_count) { ++lowest_seen_; }
+
+                        return data;
+                    }
+
+                    prev_index = min_index;
                 }
             }
 

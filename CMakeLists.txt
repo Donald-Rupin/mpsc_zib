@@ -44,3 +44,24 @@ add_test(
     COMMAND test-mpsc_queues
 )
 
+add_executable(mpsc-benchmark benchmarks/benchmarks.cpp)
+
+target_compile_options(mpsc-benchmark PUBLIC
+    -pthread
+    -fcoroutines
+    -g
+    -Wall
+    -Wextra
+)
+
+
+target_link_libraries(
+        mpsc-benchmark PUBLIC
+        -lpthread -latomic
+    )
+
+target_include_directories(mpsc-benchmark PUBLIC
+    includes
+    benchmarks
+)
+

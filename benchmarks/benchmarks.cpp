@@ -42,13 +42,14 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <latch>
 #include <map>
 #include <memory>
 #include <optional>
 #include <thread>
 #include <type_traits>
-#include <latch>
 
+#include "zib/overflow_mpsc_queue.hpp"
 #include "zib/spin_mpsc_queue.hpp"
 #include "zib/wait_mpsc_queue.hpp"
 
@@ -57,6 +58,10 @@
 #include "naive_queue.hpp"
 
 namespace zib::benchmark {
+
+    struct LessMarker {
+            std::uint64_t data_;
+    };
 
     template <typename Queue>
     std::size_t
@@ -68,13 +73,13 @@ namespace zib::benchmark {
         std::map<std::string, std::vector<std::uint64_t>> times_;
         size_t                                            count = 0;
 
-        static constexpr auto kNumberOfQueues = 5;
+        static constexpr auto kNumberOfQueues = 7;
         static constexpr auto kNumberOfRounds = 10;
 
         while (count < kNumberOfQueues * kNumberOfRounds)
         {
 
-            //std::cout << "Iteration: " << count << "\n";
+            // std::cout << "Iteration: " << count << "\n";
 
             if (count % kNumberOfQueues == 0)
             {
@@ -108,11 +113,25 @@ namespace zib::benchmark {
                     benchmark_multi_thread<spin_mpsc_queue<std::uint64_t>>(_threads, _elements);
                 times_["spin_mpsc_queue"].emplace_back(time);
             }
+            else if (count % kNumberOfQueues == 5)
+            {
+
+                auto time =
+                    benchmark_multi_thread<overflow_mpsc_queue<std::uint64_t>>(_threads, _elements);
+                times_["overflow_mpsc_queue[normal]"].emplace_back(time);
+            }
+            else if (count % kNumberOfQueues == 6)
+            {
+
+                auto time =
+                    benchmark_multi_thread<overflow_mpsc_queue<LessMarker>>(_threads, _elements);
+                times_["overflow_mpsc_queue[overflow]"].emplace_back(time);
+            }
 
             ++count;
         }
 
-        for (const auto&[name, times] : times_)
+        for (const auto& [name, times] : times_)
         {
 
             std::uint64_t average = 0;
@@ -148,8 +167,16 @@ namespace zib::benchmark {
     benchmark_multi_thread(std::size_t _threads, std::size_t _elements)
     {
 
+        static constexpr bool is_overflow =
+            std::is_same_v<Queue, overflow_mpsc_queue<typename Queue::value_type>>;
+
+        static constexpr bool has_less = std::is_same_v<LessMarker, typename Queue::value_type>;
+
+        auto queue_threads = _threads;
+        if constexpr (has_less) { queue_threads = (_threads * 2 / 3); }
+
         std::vector<std::jthread> threads(_threads);
-        Queue                     queue(_threads);
+        Queue                     queue(queue_threads);
         std::latch                lch(_threads + 2);
         auto                      number_of_cores = core_count();
 
@@ -163,7 +190,18 @@ namespace zib::benchmark {
                     using namespace std::chrono_literals;
                     for (size_t i = 0; i < _elements; ++i)
                     {
-                        queue.enqueue(i + (_elements * index), index - 1);
+                        if constexpr (has_less) {
+
+                            queue.safe_enqueue(LessMarker{i + (_elements * index)}, index - 1);
+
+                        } else if constexpr (is_overflow)
+                        {
+                            queue.safe_enqueue(i + (_elements * index), index - 1);
+                        } 
+                        else
+                        {
+                            queue.enqueue(i + (_elements * index), index - 1);
+                        }
                     }
                 });
 
@@ -184,8 +222,9 @@ namespace zib::benchmark {
                 size_t amount = 0;
                 while (amount != _elements * _threads)
                 {
-                    if constexpr (std::
-                                      is_same_v<Queue, wait_mpsc_queue<typename Queue::value_type>>)
+                    if constexpr (
+                        std::is_same_v<Queue, wait_mpsc_queue<typename Queue::value_type>> ||
+                        is_overflow)
                     {
                         queue.dequeue();
                         ++amount;
@@ -227,50 +266,69 @@ namespace zib::benchmark {
 int
 main()
 {
-    for (auto i = 1; i <= 32; i*=2) {
-        std::cout << "Test with " << i << " threads\n";
+    for (auto i = 1; i <= 32; i *= 2)
+    {
+        std::cout << "\nTest with " << i << " threads\n";
         zib::benchmark::run_benchmarks(i, 1000000);
     }
-    
+
     return 0;
 }
 
 /* Example Output
 
-dmitry_mpsc: 254819192
-multi_list: 252835174
-naive_queue: 199452915
-spin_mpsc_queue: 8722351
-wait_mpsc_queue: 13274709
+Test with 1 threads
+dmitry_mpsc: 248968107
+multi_list: 260574559
+naive_queue: 145162176
+overflow_mpsc_queue[normal]: 8437036
+overflow_mpsc_queue[overflow]: 343425668
+spin_mpsc_queue: 8799726
+wait_mpsc_queue: 18506289
+
 Test with 2 threads
-dmitry_mpsc: 304331177
-multi_list: 280580925
-naive_queue: 299178981
-spin_mpsc_queue: 37922308
-wait_mpsc_queue: 38167835
+dmitry_mpsc: 298044771
+multi_list: 284009251
+naive_queue: 275710240
+overflow_mpsc_queue[normal]: 61502005
+overflow_mpsc_queue[overflow]: 332162559
+spin_mpsc_queue: 35076795
+wait_mpsc_queue: 36393572
+
 Test with 4 threads
-dmitry_mpsc: 366495022
-multi_list: 315894548
-naive_queue: 724980671
-spin_mpsc_queue: 96374587
-wait_mpsc_queue: 79676840
+dmitry_mpsc: 359110318
+multi_list: 281302716
+naive_queue: 709754049
+overflow_mpsc_queue[normal]: 129284483
+overflow_mpsc_queue[overflow]: 404591218
+spin_mpsc_queue: 93744059
+wait_mpsc_queue: 85257270
+
 Test with 8 threads
-dmitry_mpsc: 519373840
-multi_list: 633102534
-naive_queue: 1352006855
-spin_mpsc_queue: 267449632
-wait_mpsc_queue: 199714334
+dmitry_mpsc: 511026145
+multi_list: 586108162
+naive_queue: 1283734269
+overflow_mpsc_queue[normal]: 273085780
+overflow_mpsc_queue[overflow]: 732836789
+spin_mpsc_queue: 263580060
+wait_mpsc_queue: 198014556
+
 Test with 16 threads
-dmitry_mpsc: 1165982729
-multi_list: 1792171799
-naive_queue: 2434262999
-spin_mpsc_queue: 796652621
-wait_mpsc_queue: 681314188
+dmitry_mpsc: 1122112285
+multi_list: 1781343219
+naive_queue: 2427009567
+overflow_mpsc_queue[normal]: 734528407
+overflow_mpsc_queue[overflow]: 1584028861
+spin_mpsc_queue: 836404944
+wait_mpsc_queue: 698885054
+
 Test with 32 threads
-dmitry_mpsc: 2058273292
-multi_list: 3588852466
-naive_queue: 4654888003
-spin_mpsc_queue: 2113349557
-wait_mpsc_queue: 1547190110
+dmitry_mpsc: 2015844887
+multi_list: 3440911807
+naive_queue: 4696012228
+overflow_mpsc_queue[normal]: 2039450883
+overflow_mpsc_queue[overflow]: 4078389913
+spin_mpsc_queue: 2153269691
+wait_mpsc_queue: 154316575
 
 */

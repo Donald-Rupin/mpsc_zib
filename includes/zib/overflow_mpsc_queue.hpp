@@ -31,24 +31,23 @@
  * IN THE SOFTWARE.
  *
  *
- *  @file spin_mpsc_queue.hpp
+ *  @file overflow_mpsc_queue.hpp
  *
  */
 
-#ifndef ZIB_SPIN_MPSC_QUEUE_HPP_
-#define ZIB_SPIN_MPSC_QUEUE_HPP_
+#ifndef ZIB_OVERFLOW_MPSC_QUEUE_HPP_
+#define ZIB_OVERFLOW_MPSC_QUEUE_HPP_
 
 #include <assert.h>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <optional>
 #include <vector>
 
 namespace zib {
 
-    namespace spin_details {
+    namespace overflow_details {
 
         /* Shamelssly takend from
          * https://en.cppreference.com/w/cpp/thread/hardware_destructive_interference_size
@@ -87,20 +86,22 @@ namespace zib {
         static constexpr std::size_t kDefaultMPSCSize                 = 4096;
         static constexpr std::size_t kDefaultMPSCAllocationBufferSize = 16;
 
-    }   // namespace spin_details
+    }   // namespace overflow_details
 
     template <
         typename T,
-        spin_details::Deconstructor<T> F          = spin_details::deconstruct_noop<T>,
-        std::size_t                    BufferSize = spin_details::kDefaultMPSCSize,
-        std::size_t AllocationSize                = spin_details::kDefaultMPSCAllocationBufferSize>
-    class spin_mpsc_queue {
+        overflow_details::Deconstructor<T> F          = overflow_details::deconstruct_noop<T>,
+        std::size_t                        BufferSize = overflow_details::kDefaultMPSCSize,
+        std::size_t AllocationSize = overflow_details::kDefaultMPSCAllocationBufferSize>
+    class overflow_mpsc_queue {
 
         private:
 
-            static constexpr auto kEmpty = std::numeric_limits<std::size_t>::max();
+            static constexpr auto kEmpty   = std::numeric_limits<std::size_t>::max();
+            static constexpr auto kUnknown = std::numeric_limits<std::size_t>::max();
 
-            static constexpr auto kAlignment = spin_details::hardware_destructive_interference_size;
+            static constexpr auto kAlignment =
+                overflow_details::hardware_destructive_interference_size;
 
             struct alignas(kAlignment) node {
 
@@ -140,7 +141,8 @@ namespace zib {
                     push(node_buffer* _ptr)
                     {
                         auto write_idx = write_count_.load(std::memory_order_relaxed);
-                        if (write_idx + 1 == read_count_.load(std::memory_order_acquire))
+
+                        if (write_idx + 1 == read_count_.load(std::memory_order_relaxed))
                         {
                             delete _ptr;
                             return;
@@ -153,7 +155,6 @@ namespace zib {
 
                         if (write_idx + 1 != AllocationSize)
                         {
-
                             write_count_.store(write_idx + 1, std::memory_order_release);
                         }
                         else
@@ -214,14 +215,30 @@ namespace zib {
                     }
             };
 
+            struct alignas(kAlignment) extra_node {
+
+                    extra_node() : next_(nullptr), count_(kEmpty) { }
+
+                    extra_node(T _value, std::uint64_t _count)
+                        : next_(nullptr), count_(_count), data_(_value)
+                    { }
+
+                    std::atomic<extra_node*> next_ alignas(kAlignment);
+
+                    std::atomic<std::uint64_t> count_ alignas(kAlignment);
+
+                    T data_;
+            };
+
         public:
 
             using value_type         = T;
             using deconstructor_type = F;
 
-            spin_mpsc_queue(std::uint64_t _num_threads)
-                : heads_(_num_threads), lowest_seen_(0), tails_(_num_threads), up_to_(0),
-                  buffers_(_num_threads)
+            overflow_mpsc_queue(std::uint64_t _num_threads)
+                : heads_(_num_threads), extra_head_(new extra_node), lowest_seen_(0), sleeping_(false), tails_(_num_threads),
+                  up_to_(0), buffers_(_num_threads), 
+                  extra_tail_(extra_head_)
             {
                 for (std::size_t i = 0; i < _num_threads; ++i)
                 {
@@ -232,7 +249,7 @@ namespace zib {
                 }
             }
 
-            ~spin_mpsc_queue()
+            ~overflow_mpsc_queue()
             {
                 deconstructor_type t;
 
@@ -267,10 +284,28 @@ namespace zib {
                         delete to_delete;
                     }
                 }
+
+                while (extra_head_)
+                {
+                    auto tmp    = extra_head_;
+                    extra_head_ = tmp->next_.load();
+                    delete tmp;
+                }
             }
 
             void
-            enqueue(T _data, std::uint16_t _t_id) noexcept
+            safe_enqueue(T _data, std::uint16_t _t_id) noexcept
+            {
+                if (_t_id < tails_.size()) { unsafe_enqueue(_data, _t_id); }
+                else
+                {
+
+                    overflow_enqueue(_data);
+                }
+            }
+
+            void
+            unsafe_enqueue(T _data, std::uint16_t _t_id) noexcept
             {
                 auto* buffer = tails_[_t_id];
                 if (buffer->write_head_ == BufferSize - 1)
@@ -287,75 +322,133 @@ namespace zib {
                 buffer->elements_[buffer->write_head_++].count_.store(
                     cur,
                     std::memory_order_release);
+
+                if (sleeping_.load(std::memory_order_acquire) == true) { up_to_.notify_one(); }
             }
 
-            std::optional<T>
+            void
+            overflow_enqueue(T _data)
+            {
+                auto cur = up_to_.fetch_add(1, std::memory_order_release);
+                auto ptr = new extra_node(_data, cur);
+                auto old = extra_tail_.exchange(ptr, std::memory_order_acq_rel);
+                old->next_.store(ptr, std::memory_order_release);
+
+                if (sleeping_.load(std::memory_order_acquire) == true) { up_to_.notify_one(); }
+            }
+
+            void
+            enqueue(T _data) noexcept
+            {
+                return safe_enqueue(_data, kUnknown);
+            }
+
+            T
             dequeue() noexcept
             {
-                std::int64_t prev_index = -2;
                 while (true)
                 {
-                    auto         min_count = kEmpty;
-                    std::int64_t min_index = -1;
-
-                    for (std::uint64_t i = 0; i < heads_.size(); ++i)
+                    std::int64_t prev_index = -2;
+                    while (true)
                     {
-                        assert(heads_[i]->read_head_ < BufferSize);
+                        auto         min_count = kEmpty;
+                        std::int64_t min_index = -1;
 
-                        auto count = heads_[i]->elements_[heads_[i]->read_head_].count_.load(
-                            std::memory_order_acquire);
-
-                        if (count < min_count)
+                        /* Check Unbounded */
+                        auto extra_next = extra_head_->next_.load(std::memory_order_acquire);
+                        if (extra_next)
                         {
-                            min_count = count;
-                            min_index = i;
-                            if (min_count == lowest_seen_)
+                            min_count = extra_next->count_.load(std::memory_order_acquire);
+                            min_index = prev_index;
+                        }
+
+                        /* Check bounded */
+                        for (std::uint64_t i = 0; i < heads_.size() && min_count != lowest_seen_;
+                             ++i)
+                        {
+                            assert(heads_[i]->read_head_ < BufferSize);
+
+                            auto count = heads_[i]->elements_[heads_[i]->read_head_].count_.load(
+                                std::memory_order_acquire);
+
+                            if (count < min_count)
                             {
-                                prev_index = i;
-                                break;
+                                min_count = count;
+                                min_index = i;
+                                if (min_count == lowest_seen_) { prev_index = i; }
                             }
                         }
-                    }
 
-                    if (min_index == -1 && prev_index == min_index) { return std::nullopt; }
-
-                    if (prev_index == min_index)
-                    {
-                        auto data =
-                            heads_[min_index]->elements_[heads_[min_index]->read_head_++].data_;
-
-                        if (heads_[min_index]->read_head_ == BufferSize)
+                        if (min_index == -1 && prev_index == min_index)
                         {
-
-                            auto tmp          = heads_[min_index];
-                            heads_[min_index] = tmp->next_;
-
-                            assert(heads_[min_index]);
-
-                            buffers_[min_index].push(tmp);
+                            if (up_to_.load(std::memory_order_relaxed) == lowest_seen_)
+                            {
+                                sleeping_.store(true, std::memory_order_release);
+                                up_to_.wait(lowest_seen_, std::memory_order_acquire);
+                                sleeping_.store(false, std::memory_order_relaxed);
+                            }
+                            break;
                         }
 
-                        if (lowest_seen_ == min_count) { ++lowest_seen_; }
+                        if (prev_index == min_index)
+                        {
+                            T data;
 
-                        return data;
+                            if (min_index >= 0)
+                            {
+                                data = heads_[min_index]
+                                           ->elements_[heads_[min_index]->read_head_++]
+                                           .data_;
+
+                                if (heads_[min_index]->read_head_ == BufferSize)
+                                {
+
+                                    auto tmp          = heads_[min_index];
+                                    heads_[min_index] = tmp->next_;
+
+                                    assert(heads_[min_index]);
+
+                                    buffers_[min_index].push(tmp);
+                                }
+                            }
+                            else
+                            {
+                                auto tmp    = extra_head_;
+                                extra_head_ = extra_next;
+
+                                data = extra_next->data_;
+
+                                delete tmp;
+                            }
+
+                            if (lowest_seen_ == min_count) { lowest_seen_++; }
+
+                            return data;
+                        }
+
+                        prev_index = min_index;
                     }
-
-                    prev_index = min_index;
                 }
             }
 
         private:
 
             std::vector<node_buffer*> heads_ alignas(kAlignment);
+            extra_node*               extra_head_ alignas(kAlignment);
             std::size_t               lowest_seen_;
+
+            std::atomic<bool> sleeping_ alignas(kAlignment);
 
             std::vector<node_buffer*>  tails_ alignas(kAlignment);
             std::atomic<std::uint64_t> up_to_ alignas(kAlignment);
 
             std::vector<allocation_pool> buffers_ alignas(kAlignment);
-            char                         padding_[kAlignment - sizeof(buffers_)];
+
+            std::atomic<extra_node*> extra_tail_ alignas(kAlignment);
+
+            char padding_[kAlignment - sizeof(extra_head_)];
     };
 
 }   // namespace zib
 
-#endif /* ZIB_SPIN_MPSC_QUEUE_HPP_ */
+#endif /* ZIB_OVERFLOW_MPSC_QUEUE_HPP_ */

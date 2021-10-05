@@ -4,6 +4,8 @@ High performance Unbounded Multi-Producer Single-Consumer Queues for C++20.
 
 The implementations are lock-less, wait-free and (yet to be proven formally) linearizable.
 
+See [Performance](#Performance) for benchmark results.
+
 Contact: donald.rupin@pm.me
 
 ## Repository 
@@ -34,21 +36,6 @@ The second addition is that each writer also implements a Single-Producer Single
 
 The result of the design is that if the reader can somewhat keep up with the producers, a type of linked ring buffer mode can be achieved, where no new memory is allocated. In the worst case where the producers pull ahead, they can simply allocate more `Node` arrays. The SPSC is a bounded ring buffer, and if it is full, the `Node` arrays are de-allocated to prevent memory build up.
 
-### Performance:
-
-The repository contains a benchmark and some reference implementations to compare zib queues with others. The benchmark times the amount of time required to concurrently enqueue 1,000,000 elements per thread onto the queue, whilst the consumer attempts to dequeue all elements. The total time is the time it takes the consumer to successfully dequeue number_of_threads * 1,000,000 elements. 
-
-Both zib queue variations where tested against:
-- naive queue (std::dequeue and std::mutex)
-- multilist by Andreia Coorreia and Pedro Remalhete
-- [Dmitry Vyukov mpsc queue](https://www.1024cores.net/home/lock-free-algorithms/queues/non-intrusive-mpsc-node-based-queue) 
-
-The following results were produced with `Intel i7-10875H (16 core)` Dell XPS. 
-
-![Results](images/benchmark.png).
-
-The `wait_mpsc_queue`is the fastest being 3x quicker then the simple mutex implementation, 2.3x quicker then multilist and 1.3 times quicker then dmitry's queue for the 32 threads benchmark. I would of guessed that the `spin_mpsc_queue` be the fastest - I am not sure why `wait_mpsc_queue` with the extra atomic operations and blocking is quicker. 
-
 ### Variations:
 
 #### spin_mpsc_queue
@@ -61,8 +48,27 @@ The wait queue will block when the queue is empty, and resume when the next elem
 
 #### overflow_mpsc_queue
 
-TODO:
+A `wait_mpsc_queue` queue but with the property that the number of threads is not bounded. Thread id's over the allocated amount are allowed, but the elements added by the extra threads are by themselves are not linearizable. The overflow is implemented similar to Dmitry's mpsc queue. 
 
-A `wait_mpsc_queue` queue but with the property that the number of threads is not bounded. Thread id's over the allocated amount are allowed, but the elements added by the extra thread are not linearizable.
+### Performance
+
+The repository contains a benchmark and some reference implementations to compare zib queues with others. The benchmark times the amount of time required to concurrently enqueue 1,000,000 elements per thread onto the queue, whilst the consumer attempts to dequeue all elements. The total time is the time it takes the consumer to successfully dequeue number_of_threads * 1,000,000 elements. 
+
+All zib queue variations where tested against:
+- naive queue (std::dequeue and std::mutex)
+- multilist by Andreia Coorreia and Pedro Remalhete
+- [Dmitry Vyukov mpsc queue](https://www.1024cores.net/home/lock-free-algorithms/queues/non-intrusive-mpsc-node-based-queue) 
+
+The `overflow_mpsc_queue` queue was ran twice:
+- [normal] The queue was built with the number of producer threads.
+- [overflow] The queue was built with 2/3 of the number of producer threads. The remaining threads contest for the overflow write spot.
+
+The following results were produced with `Intel i7-10875H (16 core)` Dell XPS. 
+
+![Results](images/benchmark.png).
+
+The `wait_mpsc_queue`is the fastest for all threads benchmark. I would of guessed that the `spin_mpsc_queue` would beat it - I am not sure why `wait_mpsc_queue` with the extra atomic operations and blocking is quicker. The `overflow[normal]` times indicate that the overhead for maintaining the extra overflow write spot is negligible. Although, the `overflow[overflow]` times show that if this write spot is heavily contested, throughput is reduced significantly. An application can achieve nearly peak performance with `overflow_mpsc_queue` so long as it can guarantee that overflow writes are rare. 
+
+
 
 

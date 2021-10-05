@@ -37,13 +37,14 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <thread>
-#include <iostream>
-#include <fstream>
 #include <type_traits>
 
+#include "zib/overflow_mpsc_queue.hpp"
 #include "zib/spin_mpsc_queue.hpp"
 #include "zib/wait_mpsc_queue.hpp"
 
@@ -63,7 +64,8 @@ namespace zib::test {
         return test_single_thread<spin_mpsc_queue<std::uint64_t>>() ||
                test_single_thread<wait_mpsc_queue<std::uint64_t>>() ||
                test_multi_thread<spin_mpsc_queue<std::uint64_t>>() ||
-               test_multi_thread<wait_mpsc_queue<std::uint64_t>>();
+               test_multi_thread<wait_mpsc_queue<std::uint64_t>>() ||
+               test_multi_thread<overflow_mpsc_queue<std::uint64_t>>();
     }
 
     inline std::uint16_t
@@ -96,36 +98,35 @@ namespace zib::test {
             queue.enqueue(i, 0);
             queue.enqueue(i + kElements, 0);
 
-
             size_t element = 0;
 
-            if constexpr (std::is_same_v<Queue, wait_mpsc_queue<typename Queue::value_type>>) {
+            if constexpr (std::is_same_v<Queue, wait_mpsc_queue<typename Queue::value_type>>)
+            {
 
                 element = queue.dequeue();
-
-            } else {
+            }
+            else
+            {
 
                 auto result = queue.dequeue();
 
-                if (!result) {
-                    return true;
-                }
+                if (!result) { return true; }
                 element = *result;
             }
 
             if (i != element) { return true; }
 
-            if constexpr (std::is_same_v<Queue, wait_mpsc_queue<typename Queue::value_type>>) {
+            if constexpr (std::is_same_v<Queue, wait_mpsc_queue<typename Queue::value_type>>)
+            {
 
                 element = queue.dequeue();
-
-            } else {
+            }
+            else
+            {
 
                 auto result = queue.dequeue();
 
-                if (!result) {
-                    return true;
-                }
+                if (!result) { return true; }
                 element = *result;
             }
 
@@ -142,8 +143,14 @@ namespace zib::test {
         static constexpr auto kElements      = 1000000;
         static constexpr auto kNumberThreads = 16;
 
+        static constexpr bool is_overflow =
+            std::is_same_v<Queue, overflow_mpsc_queue<typename Queue::value_type>>;
+
+        size_t n_threads = kNumberThreads;
+        if constexpr (is_overflow) { n_threads /= 2; }
+
         std::array<std::jthread, kNumberThreads> threads;
-        Queue                                    queue(kNumberThreads);
+        Queue                                    queue(n_threads);
 
         auto number_of_cores = core_count();
 
@@ -156,7 +163,14 @@ namespace zib::test {
                     using namespace std::chrono_literals;
                     for (size_t i = 0; i < kElements; ++i)
                     {
-                        queue.enqueue(i + (kElements * index), index - 1);
+                        if constexpr (is_overflow)
+                        {
+                            queue.safe_enqueue(i + (kElements * index), index - 1);
+                        }
+                        else
+                        {
+                            queue.enqueue(i + (kElements * index), index - 1);
+                        }
                     }
                 });
 
@@ -178,28 +192,32 @@ namespace zib::test {
                 size_t amount = 0;
                 while (amount != kElements * kNumberThreads)
                 {
-                    if constexpr (std::is_same_v<Queue, wait_mpsc_queue<typename Queue::value_type>>) {
+                    if constexpr (
+                        std::is_same_v<Queue, wait_mpsc_queue<typename Queue::value_type>> ||
+                        is_overflow)
+                    {
 
                         queue.dequeue();
                         ++amount;
 
-                    } else {
-
-                        auto result = queue.dequeue();
-                        if (result) {
-                            ++amount;
-                        }
-
-                        if (amount == kElements * kNumberThreads) {
-                            auto result = queue.dequeue();
-
-                            if (result) {
-
-                                result = true;
-                            }
+                        if constexpr (is_overflow)
+                        {
+                            // std::cout << "Done: " << amount << "\n";
                         }
                     }
-                    
+                    else
+                    {
+
+                        auto result = queue.dequeue();
+                        if (result) { ++amount; }
+
+                        if (amount == kElements * kNumberThreads)
+                        {
+                            auto result = queue.dequeue();
+
+                            if (result) { result = true; }
+                        }
+                    }
                 }
             }
 

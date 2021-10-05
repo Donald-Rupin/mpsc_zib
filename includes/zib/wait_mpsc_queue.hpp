@@ -31,7 +31,7 @@
  * IN THE SOFTWARE.
  *
  *
- *  @file mpsc_queue.hpp
+ *  @file wait_mpsc_queue.hpp
  *
  */
 
@@ -90,9 +90,9 @@ namespace zib {
 
     template <
         typename T,
-        wait_details::Deconstructor<T> F              = wait_details::deconstruct_noop<T>,
-        std::size_t                    BufferSize     = wait_details::kDefaultMPSCSize,
-        std::size_t                    AllocationSize = wait_details::kDefaultMPSCAllocationBufferSize>
+        wait_details::Deconstructor<T> F          = wait_details::deconstruct_noop<T>,
+        std::size_t                    BufferSize = wait_details::kDefaultMPSCSize,
+        std::size_t AllocationSize                = wait_details::kDefaultMPSCAllocationBufferSize>
     class wait_mpsc_queue {
 
         private:
@@ -186,6 +186,31 @@ namespace zib {
 
                         return tmp;
                     }
+
+                    node_buffer*
+                    drain()
+                    {
+                        auto read_idx = read_count_.load(std::memory_order_relaxed);
+                        if (read_idx == write_count_.load(std::memory_order_relaxed))
+                        {
+                            return nullptr;
+                        }
+
+                        auto tmp = items_[read_idx].ptr_;
+
+                        if (read_idx + 1 != AllocationSize)
+                        {
+
+                            read_count_.store(read_idx + 1, std::memory_order_relaxed);
+                        }
+                        else
+                        {
+
+                            read_count_.store(0, std::memory_order_relaxed);
+                        }
+
+                        return tmp;
+                    }
             };
 
         public:
@@ -194,8 +219,8 @@ namespace zib {
             using deconstructor_type = F;
 
             wait_mpsc_queue(std::uint64_t _num_threads)
-                : heads_(_num_threads), lowest_seen_(0), sleeping_(false), tails_(_num_threads), up_to_(0),
-                  buffers_(_num_threads)
+                : heads_(_num_threads), lowest_seen_(0), sleeping_(false), tails_(_num_threads),
+                  up_to_(0), buffers_(_num_threads)
             {
                 for (std::size_t i = 0; i < _num_threads; ++i)
                 {
@@ -230,6 +255,15 @@ namespace zib {
                         auto tmp = h->next_;
                         delete h;
                         h = tmp;
+                    }
+                }
+
+                for (auto& q : buffers_)
+                {
+                    node_buffer* to_delete = nullptr;
+                    while ((to_delete = q.drain()))
+                    {
+                        delete to_delete;
                     }
                 }
             }

@@ -47,6 +47,7 @@
 #include "zib/overflow_mpsc_queue.hpp"
 #include "zib/spin_mpsc_queue.hpp"
 #include "zib/wait_mpsc_queue.hpp"
+#include "zib/spin_overflow_mpsc_queue.hpp"
 
 namespace zib::test {
 
@@ -65,7 +66,8 @@ namespace zib::test {
                test_single_thread<wait_mpsc_queue<std::uint64_t>>() ||
                test_multi_thread<spin_mpsc_queue<std::uint64_t>>() ||
                test_multi_thread<wait_mpsc_queue<std::uint64_t>>() ||
-               test_multi_thread<overflow_mpsc_queue<std::uint64_t>>();
+               test_multi_thread<overflow_mpsc_queue<std::uint64_t>>()||
+               test_multi_thread<spin_overflow_mpsc_queue<std::uint64_t>>();
     }
 
     inline std::uint16_t
@@ -144,7 +146,8 @@ namespace zib::test {
         static constexpr auto kNumberThreads = 16;
 
         static constexpr bool is_overflow =
-            std::is_same_v<Queue, overflow_mpsc_queue<typename Queue::value_type>>;
+            std::is_same_v<Queue, overflow_mpsc_queue<typename Queue::value_type>> ||
+            std::is_same_v<Queue, spin_overflow_mpsc_queue<typename Queue::value_type>>;
 
         size_t n_threads = kNumberThreads;
         if constexpr (is_overflow) { n_threads /= 2; }

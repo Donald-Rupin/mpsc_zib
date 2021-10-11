@@ -289,7 +289,7 @@ namespace zib {
                 {
                     auto tmp    = extra_head_;
                     extra_head_ = tmp->next_.load();
-                    t(&tmp.data());
+                    t(&tmp->data_);
                     delete tmp;
                 }
             }
